@@ -1,0 +1,114 @@
+name: CI – Lab 05 Docker Compose Readiness
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint-openapi:
+    name: Lint OpenAPI Contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint OpenAPI contracts
+        run: npm run lint:openapi
+
+  build-and-test:
+    name: Build & Newman Test
+    runs-on: ubuntu-latest
+    needs: lint-openapi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create .env from .env.example
+        run: cp .env.example .env
+
+      - name: Build & start Docker Compose stack
+        run: docker compose up -d --build
+
+      - name: Wait for all services to be healthy
+        run: |
+          echo "Waiting for API to be healthy..."
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ API is healthy!"
+              break
+            fi
+            echo "Attempt $i: API status=$STATUS, retrying in 5s..."
+            sleep 5
+          done
+          
+          echo "Waiting for AI service to be healthy..."
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ AI service is healthy!"
+              break
+            fi
+            echo "Attempt $i: AI status=$STATUS, retrying in 5s..."
+            sleep 5
+          done
+
+      - name: Verify API health endpoint
+        run: |
+          RESPONSE=$(curl -s http://localhost:8000/health)
+          echo "API health: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"status":"ok"'
+
+      - name: Verify AI service health endpoint
+        run: |
+          RESPONSE=$(curl -s http://localhost:9000/health)
+          echo "AI health: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"status":"ok"'
+
+      - name: Verify DB readiness
+        run: |
+          docker exec fit4110-db-lab05 pg_isready -U lab05
+          echo "✅ DB is ready!"
+
+      - name: Setup Node.js for Newman
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run Newman tests
+        run: |
+          npx newman run postman/collections/FIT4110_lab05_iot.postman_collection.json \
+            --environment postman/environments/FIT4110_lab05_local.postman_environment.json \
+            --reporters cli,junit,htmlextra \
+            --reporter-junit-export reports/newman-lab05-compose.xml \
+            --reporter-htmlextra-export reports/newman-lab05-compose.html
+
+      - name: Upload Newman reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: newman-reports
+          path: reports/
+
+      - name: Show compose logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
